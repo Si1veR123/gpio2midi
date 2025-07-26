@@ -1,3 +1,4 @@
+This is currently mostly ChatGPT and not checked, I will improve this when I can.
 # gpio2midi
 
 **gpio2midi** is a Rust application that converts Raspberry Pi GPIO inputs—buttons and rotary encoders—into MIDI Control Change (CC) messages sent through a virtual MIDI port. It enables custom hardware MIDI controllers by bridging physical GPIO events to MIDI.
