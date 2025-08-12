@@ -2,8 +2,9 @@ use anyhow::Result;
 use clap::Parser;
 use ctrlc;
 use homedir::my_home;
+use midir::os::unix::VirtualOutput;
 use midir::{MidiOutput, MidiOutputConnection};
-use rppal::gpio::{Event, Gpio, InputPin, Level, Trigger};
+use rppal::gpio::{Gpio, InputPin, Level, Trigger};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
@@ -31,7 +32,7 @@ enum ControlConfig {
         pin: u8,
         cc: u8,
         #[serde(default)]
-        pull_up: bool,
+        pull_down: bool,
         #[serde(default)]
         debounce_ms: Option<u64>,
     },
@@ -66,7 +67,7 @@ enum ControlType {
     },
 }
 
-fn send_cc(conn: &MidiOutputConnection, cc: u8, value: u8) {
+fn send_cc(conn: &mut MidiOutputConnection, cc: u8, value: u8) {
     let _ = conn.send(&[0xB0, cc, value]);
 }
 
@@ -115,36 +116,37 @@ impl RotaryEncoderState {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let default_config = my_home()
-        .map(|p| p.join("gpio2midi.toml"))
-        .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+    let default_config = my_home()?
+        .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
+        .join("gpio2midi.toml");
 
     let config_path = args.config.unwrap_or(default_config);
     let config: Config = toml::from_str(&fs::read_to_string(config_path)?)?;
 
     let gpio = Gpio::new()?;
     let midi_out = MidiOutput::new(&args.port)?;
-    let conn = Arc::new(midi_out.create_virtual(&args.port)?);
+    let mut conn = midi_out.create_virtual(&args.port).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let mut pin_map: HashMap<u8, ControlType> = HashMap::new();
 
     for control in config.controls.iter() {
         match control {
-            ControlConfig::Button { pin, cc, pull_up, debounce_ms } => {
-                let mut gpio_pin = gpio.get(*pin)?;
-                if *pull_up {
-                    gpio_pin = gpio_pin.into_input_pullup();
+            ControlConfig::Button { pin, cc, pull_down, debounce_ms } => {
+                let gpio_pin = gpio.get(*pin)?;
+                let mut gpio_in_pin: InputPin;
+                if *pull_down {
+                    gpio_in_pin = gpio_pin.into_input_pulldown();
                 } else {
-                    gpio_pin = gpio_pin.into_input_pulldown();
+                    gpio_in_pin = gpio_pin.into_input_pullup();
                 }
                 let debounce = debounce_ms.map(Duration::from_millis).or(Some(Duration::from_millis(5)));
-                gpio_pin.set_interrupt(Trigger::Both, debounce)?;
-                let arc_pin = Arc::new(gpio_pin);
+                gpio_in_pin.set_interrupt(Trigger::Both, debounce)?;
+                let arc_pin = Arc::new(gpio_in_pin);
                 pin_map.insert(arc_pin.pin(), ControlType::Button { cc: *cc, pin: arc_pin });
             }
             ControlConfig::RotaryEncoder { pin_a, pin_b, cc, debounce_ms, relative_value } => {
                 let mut a = gpio.get(*pin_a)?.into_input_pullup();
-                let mut b = gpio.get(*pin_b)?.into_input_pullup();
+                let b = gpio.get(*pin_b)?.into_input_pullup();
                 let debounce = debounce_ms.map(Duration::from_millis).or(Some(Duration::from_millis(1)));
                 a.set_interrupt(Trigger::Both, debounce)?;
                 let arc_a = Arc::new(a);
@@ -164,6 +166,10 @@ fn main() -> Result<()> {
         }
     }
 
+    if cfg!(feature = "print") {
+        println!("Using pins: {:?}", pin_map);
+    }
+
     let pin_refs: Vec<&InputPin> = pin_map.values().map(|control| match control {
         ControlType::Button { pin, .. } => pin.as_ref(),
         ControlType::RotaryEncoder { pin_a, .. } => pin_a.as_ref(),
@@ -177,27 +183,36 @@ fn main() -> Result<()> {
     })?;
 
     while running.load(Ordering::SeqCst) {
-        if let Some((pin, _event)) = rppal::gpio::poll_interrupts(&pin_refs, true, Some(Duration::from_millis(100)))? {
+        if let Some((pin, _event)) = gpio.poll_interrupts(&pin_refs, true, Some(Duration::from_millis(100)))? {
             let pin_num = pin.pin();
-            if let Some(control) = pin_map.get_mut(&pin_num) {
+            if let Some(control) = pin_map.get(&pin_num) {
                 match control {
                     ControlType::Button { cc, pin } => {
                         let value = if pin.read() == Level::Low { 127 } else { 0 };
-                        send_cc(&conn, *cc, value);
+                        if cfg!(feature = "print") {
+                            println!("Button press detected on pin: {:?}, value: {:?}", pin_num, value);
+                        }
+                        send_cc(&mut conn, *cc, value);
                     }
                     ControlType::RotaryEncoder { cc, pin_a, pin_b, state, relative } => {
                         let mut s = state.lock().unwrap();
                         if let Some(dir) = s.update(pin_a.read(), pin_b.read()) {
                             if *relative {
                                 let delta = if dir > 0 { 1 } else { 127 }; // 127 == -1
-                                send_cc(&conn, *cc, delta);
+                                if cfg!(feature = "print") {
+                                    println!("Rotary encoder detected on pin a: {:?}, pin b {:?}, cc: {:?}, relative value: {:?}", pin_a.pin(), pin_b.pin(), cc, delta);
+                                }
+                                send_cc(&mut conn, *cc, delta);
                             } else {
                                 if dir > 0 {
                                     s.value = s.value.saturating_add(1);
                                 } else {
                                     s.value = s.value.saturating_sub(1);
                                 }
-                                send_cc(&conn, *cc, s.value);
+                                if cfg!(feature = "print") {
+                                    println!("Rotary encoder detected on pin a: {:?}, pin b {:?}, cc {:?}, absolute value: {:?}", pin_a.pin(), pin_b.pin(), cc, s.value);
+                                }
+                                send_cc(&mut conn, *cc, s.value);
                             }
                         }
                     }

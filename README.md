@@ -24,7 +24,7 @@ Controls are defined in a TOML configuration file with the following structures 
 
 - `pin`: GPIO pin number.
 - `cc`: MIDI Control Change number to send.
-- `pull_up` (optional, default: `false`): Enable internal pull-up resistor.
+- `pull_down` (optional, default: `false`): Enable internal pull-down resistor, else pull-up is enabled.
 - `debounce_ms` (optional, default: `5` ms): Debounce duration in milliseconds.
 
 ### RotaryEncoder

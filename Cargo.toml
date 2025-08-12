@@ -3,6 +3,9 @@ name = "gpio2midi"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+print = []
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.2", features = ["derive"] }
