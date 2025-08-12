@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use ctrlc;
-use homedir::get_my_home;
+use homedir::my_home;
 use midir::{MidiOutput, MidiOutputConnection};
 use rppal::gpio::{Event, Gpio, InputPin, Level, Trigger};
 use serde::Deserialize;
@@ -115,7 +115,7 @@ impl RotaryEncoderState {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let default_config = get_my_home()
+    let default_config = my_home()
         .map(|p| p.join("gpio2midi.toml"))
         .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
 
