@@ -4,14 +4,14 @@ use ctrlc;
 use homedir::my_home;
 use midir::os::unix::VirtualOutput;
 use midir::{MidiOutput, MidiOutputConnection};
-use rppal::gpio::{Gpio, InputPin, Level, Trigger};
+use rppal::gpio::{Event, Gpio, InputPin, Level, Trigger};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -55,8 +55,7 @@ struct Config {
 #[derive(Debug)]
 enum ControlType {
     Button {
-        cc: u8,
-        pin: Arc<InputPin>,
+        cc: u8
     },
     RotaryEncoder {
         cc: u8,
@@ -98,6 +97,11 @@ impl RotaryEncoderState {
 
     fn update(&mut self, a: Level, b: Level) -> Option<i8> {
         let new_state = ((a == Level::High) as u8) << 1 | ((b == Level::High) as u8);
+
+        if new_state == self.prev_state {
+            return None; // No change, ignore
+        }
+
         let index = (self.prev_state << 2) | new_state;
         let movement = TRANSITION_TABLE[index as usize];
         self.accum += movement;
@@ -113,7 +117,8 @@ impl RotaryEncoderState {
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = Args::parse();
 
     let default_config = my_home()?
@@ -127,12 +132,15 @@ fn main() -> Result<()> {
     let midi_out = MidiOutput::new(&args.port)?;
     let mut conn = midi_out.create_virtual(&args.port).map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    let (tx, mut rx) = mpsc::channel::<(u8, Event)>(100);
+
     let mut pin_map: HashMap<u8, ControlType> = HashMap::new();
 
     for control in config.controls.iter() {
         match control {
             ControlConfig::Button { pin, cc, pull_down, debounce_ms } => {
-                let gpio_pin = gpio.get(*pin)?;
+                let pin = *pin;
+                let gpio_pin = gpio.get(pin)?;
                 let mut gpio_in_pin: InputPin;
                 if *pull_down {
                     gpio_in_pin = gpio_pin.into_input_pulldown();
@@ -140,20 +148,40 @@ fn main() -> Result<()> {
                     gpio_in_pin = gpio_pin.into_input_pullup();
                 }
                 let debounce = debounce_ms.map(Duration::from_millis).or(Some(Duration::from_millis(5)));
-                gpio_in_pin.set_interrupt(Trigger::Both, debounce)?;
-                let arc_pin = Arc::new(gpio_in_pin);
-                pin_map.insert(arc_pin.pin(), ControlType::Button { cc: *cc, pin: arc_pin });
+                let tx_clone = tx.clone();
+                gpio_in_pin.set_async_interrupt(Trigger::Both, debounce, move |event| {
+                    let _ = tx_clone.clone().try_send((pin, event));
+                })?;
+                pin_map.insert(pin, ControlType::Button { cc: *cc });
             }
             ControlConfig::RotaryEncoder { pin_a, pin_b, cc, debounce_ms, relative_value } => {
-                let mut a = gpio.get(*pin_a)?.into_input_pullup();
-                let b = gpio.get(*pin_b)?.into_input_pullup();
+                let (pin_a, pin_b) = (*pin_a, *pin_b);
+                let mut a = gpio.get(pin_a)?.into_input_pullup();
+                let mut b = gpio.get(pin_b)?.into_input_pullup();
                 let debounce = debounce_ms.map(Duration::from_millis).or(Some(Duration::from_millis(1)));
-                a.set_interrupt(Trigger::Both, debounce)?;
+                let tx_clone_a = tx.clone();
+                a.set_async_interrupt(Trigger::Both, debounce, move |event| {
+                    let _ = tx_clone_a.clone().try_send((pin_a, event));
+                })?;
+                let tx_clone_b = tx.clone();
+                b.set_async_interrupt(Trigger::Both, debounce, move |event| {
+                    let _ = tx_clone_b.clone().try_send((pin_b, event));
+                })?;
                 let arc_a = Arc::new(a);
                 let arc_b = Arc::new(b);
                 let state = Arc::new(Mutex::new(RotaryEncoderState::new(arc_a.read(), arc_b.read(), 64)));
                 pin_map.insert(
                     arc_a.pin(),
+                    ControlType::RotaryEncoder {
+                        cc: *cc,
+                        pin_a: arc_a.clone(),
+                        pin_b: arc_b.clone(),
+                        state: state.clone(),
+                        relative: *relative_value,
+                    },
+                );
+                pin_map.insert(
+                    arc_b.pin(),
                     ControlType::RotaryEncoder {
                         cc: *cc,
                         pin_a: arc_a,
@@ -170,50 +198,44 @@ fn main() -> Result<()> {
         println!("Using pins: {:?}", pin_map);
     }
 
-    let pin_refs: Vec<&InputPin> = pin_map.values().map(|control| match control {
-        ControlType::Button { pin, .. } => pin.as_ref(),
-        ControlType::RotaryEncoder { pin_a, .. } => pin_a.as_ref(),
-    }).collect();
-
-    // Handle Ctrl+C to exit cleanly
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-    ctrlc::set_handler(move || {
-        r.store(false, Ordering::SeqCst);
-    })?;
-
-    while running.load(Ordering::SeqCst) {
-        if let Some((pin, _event)) = gpio.poll_interrupts(&pin_refs, true, Some(Duration::from_millis(100)))? {
-            let pin_num = pin.pin();
-            if let Some(control) = pin_map.get(&pin_num) {
-                match control {
-                    ControlType::Button { cc, pin } => {
-                        let value = if pin.read() == Level::Low { 127 } else { 0 };
-                        if cfg!(feature = "print") {
-                            println!("Button press detected on pin: {:?}, value: {:?}", pin_num, value);
-                        }
-                        send_cc(&mut conn, *cc, value);
+    while let Some((pin_num, event)) = rx.recv().await {
+        if cfg!(feature = "print") {
+            println!("Interrupt event on pin {pin_num}: {:?}", event);
+        }
+        if let Some(control) = pin_map.get(&pin_num) {
+            match control {
+                ControlType::Button { cc } => {
+                    let value = if event.trigger == Trigger::FallingEdge { 127 } else { 0 };
+                    if cfg!(feature = "print") {
+                        println!("Button press detected on pin: {:?}, value: {:?}", pin_num, value);
                     }
-                    ControlType::RotaryEncoder { cc, pin_a, pin_b, state, relative } => {
-                        let mut s = state.lock().unwrap();
-                        if let Some(dir) = s.update(pin_a.read(), pin_b.read()) {
-                            if *relative {
-                                let delta = if dir > 0 { 1 } else { 127 }; // 127 == -1
-                                if cfg!(feature = "print") {
-                                    println!("Rotary encoder detected on pin a: {:?}, pin b {:?}, cc: {:?}, relative value: {:?}", pin_a.pin(), pin_b.pin(), cc, delta);
-                                }
-                                send_cc(&mut conn, *cc, delta);
-                            } else {
-                                if dir > 0 {
-                                    s.value = s.value.saturating_add(1);
-                                } else {
-                                    s.value = s.value.saturating_sub(1);
-                                }
-                                if cfg!(feature = "print") {
-                                    println!("Rotary encoder detected on pin a: {:?}, pin b {:?}, cc {:?}, absolute value: {:?}", pin_a.pin(), pin_b.pin(), cc, s.value);
-                                }
-                                send_cc(&mut conn, *cc, s.value);
+                    send_cc(&mut conn, *cc, value);
+                }
+                ControlType::RotaryEncoder { cc, pin_a, pin_b, state, relative } => {
+                    let a_val = pin_a.read();
+                    let b_val = pin_b.read();
+                    
+                    let mut s = state.lock().unwrap();
+                    if cfg!(feature = "print") {
+                        println!("Updating rotary encoder with values a: {a_val}, b: {b_val}");
+                    }
+                    if let Some(dir) = s.update(a_val, b_val) {
+                        if *relative {
+                            let delta = if dir > 0 { 1 } else { 127 }; // 127 == -1
+                            if cfg!(feature = "print") {
+                                println!("Rotary encoder detected on pin a: {:?}, pin b {:?}, cc: {:?}, relative value: {:?}", pin_a.pin(), pin_b.pin(), cc, delta);
                             }
+                            send_cc(&mut conn, *cc, delta);
+                        } else {
+                            if dir > 0 {
+                                s.value = s.value.saturating_add(1);
+                            } else {
+                                s.value = s.value.saturating_sub(1);
+                            }
+                            if cfg!(feature = "print") {
+                                println!("Rotary encoder detected on pin a: {:?}, pin b {:?}, cc {:?}, absolute value: {:?}", pin_a.pin(), pin_b.pin(), cc, s.value);
+                            }
+                            send_cc(&mut conn, *cc, s.value);
                         }
                     }
                 }
