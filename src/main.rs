@@ -1,6 +1,5 @@
 use anyhow::Result;
 use clap::Parser;
-use ctrlc;
 use homedir::my_home;
 use midir::os::unix::VirtualOutput;
 use midir::{MidiOutput, MidiOutputConnection};
@@ -24,6 +23,10 @@ struct Args {
     /// MIDI virtual port name
     #[arg(short, long, default_value = "gpio2midi")]
     port: String,
+
+    /// Polling rate for rotary encoder pins in hz
+    #[arg(short, long, default_value_t = 4000.0)]
+    polling_rate: f64
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,8 +45,6 @@ enum ControlConfig {
         pin_b: u8,
         cc: u8,
         #[serde(default)]
-        debounce_ms: Option<u64>,
-        #[serde(default)]
         relative_value: bool,
     },
 }
@@ -56,7 +57,9 @@ struct Config {
 #[derive(Debug)]
 enum ControlType {
     Button {
-        cc: u8
+        cc: u8,
+        // Keep alive for interrupt
+        _pin: Arc<InputPin>
     },
     RotaryEncoder {
         cc: u8,
@@ -68,15 +71,23 @@ enum ControlType {
 }
 
 fn send_cc(conn: &mut MidiOutputConnection, cc: u8, value: u8) {
+    if cfg!(feature = "print") {
+        println!("Sending cc: {cc}, value: {value}");
+    }
+
     let _ = conn.send(&[0xB0, cc, value]);
 }
 
 // Gray code state machine transition table for rotary encoders
 const TRANSITION_TABLE: [i8; 16] = [
-     0, -1,  1,  0,
-     1,  0,  0, -1,
-    -1,  0,  0,  1,
+    // prev: 00
      0,  1, -1,  0,
+    // prev: 01
+    -1,  0,  0,  1,
+    // prev: 10
+     1,  0,  0, -1,
+    // prev: 11
+     0, -1,  1,  0,
 ];
 
 #[derive(Debug)]
@@ -131,7 +142,7 @@ async fn main() -> Result<()> {
 
     let gpio = Gpio::new()?;
     let midi_out = MidiOutput::new(&args.port)?;
-    let mut conn = Arc::new(Mutex::new(midi_out.create_virtual(&args.port).map_err(|e| anyhow::anyhow!("{e}"))?));
+    let conn = Arc::new(Mutex::new(midi_out.create_virtual(&args.port).map_err(|e| anyhow::anyhow!("{e}"))?));
 
     let (tx, mut rx) = mpsc::channel::<(u8, Event)>(100);
 
@@ -154,9 +165,9 @@ async fn main() -> Result<()> {
                 gpio_in_pin.set_async_interrupt(Trigger::Both, debounce, move |event| {
                     let _ = tx_clone.clone().try_send((pin, event));
                 })?;
-                pin_map.insert(pin, ControlType::Button { cc: *cc });
+                pin_map.insert(pin, ControlType::Button { cc: *cc, _pin: Arc::new(gpio_in_pin) });
             }
-            ControlConfig::RotaryEncoder { pin_a, pin_b, cc, debounce_ms, relative_value } => {
+            ControlConfig::RotaryEncoder { pin_a, pin_b, cc, relative_value } => {
                 let (pin_a, pin_b) = (*pin_a, *pin_b);
                 let a = gpio.get(pin_a)?.into_input_pullup();
                 let b = gpio.get(pin_b)?.into_input_pullup();
@@ -186,6 +197,7 @@ async fn main() -> Result<()> {
     let pin_map = Arc::new(pin_map);
     let pin_map_clone = pin_map.clone();
     let mut previous_rotary_enc_levels = HashMap::new();
+    let polling_sleep = Duration::from_secs_f64(1.0 / args.polling_rate as f64);
     tokio::spawn(async move {
         loop {
             for control in pin_map_clone.values() {
@@ -203,10 +215,6 @@ async fn main() -> Result<()> {
                     previous_levels_entry.0 = a_val;
                     previous_levels_entry.1 = b_val;
 
-                    if cfg!(feature = "print") {
-                        println!("Rotary encoder changed: a: {a_val}, b: {b_val}");
-                    }
-
                     let mut s = state.lock().unwrap();
                     if let Some(dir) = s.update(a_val, b_val) {
                         if *relative {
@@ -223,7 +231,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            sleep(Duration::from_micros(500)).await;
+            sleep(polling_sleep).await;
         }
     });
 
@@ -232,7 +240,7 @@ async fn main() -> Result<()> {
             println!("Event on pin {pin}, {event:?}");
         }
 
-        if let ControlType::Button { cc } = pin_map.get(&pin).expect("Pin should exist") {
+        if let ControlType::Button { _pin, cc } = pin_map.get(&pin).expect("Pin should exist") {
             send_cc(&mut conn.lock().expect("Failed to lock midi port"), *cc, if event.trigger == Trigger::RisingEdge { 127 } else { 0 });
         }
         

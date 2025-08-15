@@ -14,7 +14,7 @@
 ## Arguments
 - `-c`/`--config` (optional, default: `~/gpio2midi.toml`): path to config file
 - `-p`/`--port` (optional, default: `gpio2midi`): name of the virtual midi port 
-
+- `--polling-rate` (optional, default: `4000.0`): rotary encoder polling rate in Hz.
 
 ## Configuration
 
@@ -33,7 +33,6 @@ Controls are defined in a TOML configuration file with the following structures 
 - `pin_b`: GPIO pin for encoder channel B.
 - `cc`: MIDI Control Change number.
 - `relative_value` (optional, default: `false`): Send relative increments/decrements if true. `1`: increment. `127`: decrement.
-- `debounce_ms` (optional, default: `1` ms): Debounce duration in milliseconds.
 
 ### Example
 ```toml
@@ -56,7 +55,6 @@ type = "RotaryEncoder"
 pin_a = 5
 pin_b = 6
 cc = 22
-debounce_ms = 5
 relative_value = false
 
 [[controls]]
@@ -64,7 +62,6 @@ type = "RotaryEncoder"
 pin_a = 13
 pin_b = 19
 cc = 23
-# debounce_ms is optional
 relative_value = true
 ```
 
