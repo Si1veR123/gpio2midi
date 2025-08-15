@@ -14,7 +14,7 @@
 ## Arguments
 - `-c`/`--config` (optional, default: `~/gpio2midi.toml`): path to config file
 - `-p`/`--port` (optional, default: `gpio2midi`): name of the virtual midi port 
-- `--polling-rate` (optional, default: `4000.0`): rotary encoder polling rate in Hz.
+- `--polling-rate` (optional, default: `2000.0`): rotary encoder polling rate in Hz.
 
 ## Configuration
 
