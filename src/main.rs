@@ -241,7 +241,7 @@ async fn main() -> Result<()> {
         }
 
         if let ControlType::Button { _pin, cc } = pin_map.get(&pin).expect("Pin should exist") {
-            send_cc(&mut conn.lock().expect("Failed to lock midi port"), *cc, if event.trigger == Trigger::RisingEdge { 127 } else { 0 });
+            send_cc(&mut conn.lock().expect("Failed to lock midi port"), *cc, if event.trigger == Trigger::RisingEdge { 0 } else { 127 });
         }
         
     }
